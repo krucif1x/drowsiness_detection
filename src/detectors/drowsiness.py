@@ -1,164 +1,195 @@
 import time
 import logging
 import yaml
+import math
 import numpy as np
-from pathlib import Path
-from typing import Optional
-from dataclasses import dataclass
-from src.infrastructure.data.models import UserProfile
+from collections import deque
 from src.services.system_logger import SystemLogger
 
-@dataclass
-class DetectorConfig:
-    drowsy_start_frames: int
-    drowsy_end_grace_frames: int
-    min_episode_frames: int
-    yawn_threshold_frames: int
-    yawn_cooldown_frames: int
-    smile_suppress_frames: int
-    laugh_suppress_frames: int
-    blink_closed_frames: int
-    min_episode_sec: float
-    
-    @classmethod
-    def from_yaml(cls, config_path: str, fps: float) -> 'DetectorConfig':
-        path = Path(config_path)
-        if not path.exists(): return cls.default(fps)
-        try:
-            with open(path, 'r') as f:
-                cfg = yaml.safe_load(f)
-            return cls(
-                drowsy_start_frames=int(cfg['drowsiness']['start_threshold_sec'] * fps),
-                drowsy_end_grace_frames=int(cfg['drowsiness']['end_grace_sec'] * fps),
-                min_episode_frames=int(cfg['drowsiness']['min_episode_sec'] * fps),
-                min_episode_sec=cfg['drowsiness']['min_episode_sec'],
-                blink_closed_frames=cfg['blink']['closed_frames'],
-                yawn_threshold_frames=int(cfg['yawn']['threshold_sec'] * fps),
-                yawn_cooldown_frames=int(cfg['yawn']['cooldown_sec'] * fps),
-                smile_suppress_frames=int(cfg['expression']['smile_suppress_sec'] * fps),
-                laugh_suppress_frames=int(cfg['expression']['laugh_suppress_sec'] * fps),
-            )
-        except: return cls.default(fps)
-    
-    @classmethod
-    def default(cls, fps):
-        return cls(int(1.0*fps), int(0.5*fps), int(1.0*fps), 1.0, 2, int(0.27*fps), int(2.0*fps), int(0.5*fps), int(0.67*fps))
-
 class DrowsinessDetector:
+    """
+    Detects drowsiness (low EAR over time) and yawning (MAR/expr/hands).
+    Fainting is not judged here; use FaintingDetector separately.
+    """
+
     def __init__(self, logger: SystemLogger, fps: float = 30.0, config_path: str = "config/detector_config.yaml"):
         self.logger = logger
-        self.config = DetectorConfig.from_yaml(config_path, fps)
+        self.fps = fps
+        self.config = self._load_config(config_path)
         self.user = None
-        self.dynamic_ear_threshold = 0.22
+
+        # State Tracking
         self._last_frame_rgb = None
+        self.ear_history = deque(maxlen=int(1.0 * fps))  # 1 second buffer
+        self.ear_drop_detected = False
+
+        # Dynamic EAR thresholds (loaded from user profile or config)
+        self.dynamic_ear_thresh = self.config['ear_low']
+
         self.counters = {
-            'DROWSINESS_FRAMES': 0, 'DROWSY_RECOVERY_FRAMES': 0, 
-            'YAWN_FRAMES': 0, 'YAWN_COOLDOWN': 0, 'BLINK_COUNT': 0, 
-            'EYE_CLOSED_FRAMES': 0, 'SMILE_SUPPRESS_COUNTER': 0, 
-            'LAUGH_SUPPRESS_COUNTER': 0,
-            'HAND_OVER_MOUTH_FRAMES': 0 # NEW COUNTER
+            'DROWSINESS': 0, 'RECOVERY': 0, 'YAW': 0, 'YAW_COOL': 0,
+            'BLINK': 0, 'EYES_CLOSED': 0, 'SMILE_SUP': 0, 'LAUGH_SUP': 0,
         }
-        self.episode = {'active': False, 'start_time': None, 'start_frame_rgb': None, 'min_ear': 1.0, 'max_ear': 0.0}
-        self.states = {'IS_DROWSY': False, 'IS_YAWNING': False}
-        
-    def set_last_frame(self, frame, color_space="RGB"):
-        if frame is not None: self._last_frame_rgb = frame.copy()
+
+        self.states = {'IS_DROWSY': False, 'IS_YAWNING': False, 'EYES_CLOSED': False}
+        self.episode = {'active': False, 'start_time': None, 'min_ear': 1.0, 'start_frame': None}
+
+        logging.info("DrowsinessDetector initialized (Clean, no fainting)")
+
+    def _load_config(self, path_str):
+        default = {
+            'drowsy_start': int(0.8 * self.fps), 'drowsy_end': int(1.5 * self.fps),
+            'min_episode_sec': 2.0, 'ear_low': 0.22, 'ear_high': 0.26, 'ear_drop': 0.10,
+            'yawn_thresh': int(0.4 * self.fps), 'yawn_cool': int(3.0 * self.fps),
+            'smile_sup': int(0.5 * self.fps), 'laugh_sup': int(1.0 * self.fps)
+        }
+        try:
+            with open(path_str, 'r') as f:
+                raw = yaml.safe_load(f) or {}
+                d, y, e = raw.get('drowsiness', {}), raw.get('yawn', {}), raw.get('expression', {})
+                return {
+                    'drowsy_start': int(d.get('start_threshold_sec', 0.8) * self.fps),
+                    'drowsy_end': int(d.get('end_grace_sec', 1.5) * self.fps),
+                    'min_episode_sec': d.get('min_episode_sec', 2.0),
+                    'ear_low': d.get('ear_low_threshold', 0.22),
+                    'ear_high': d.get('ear_high_threshold', 0.26),
+                    'ear_drop': d.get('ear_drop_threshold', 0.10),
+                    'yawn_thresh': int(y.get('threshold_sec', 0.4) * self.fps),
+                    'yawn_cool': int(y.get('cooldown_sec', 3.0) * self.fps),
+                    'smile_sup': int(e.get('smile_suppress_sec', 0.5) * self.fps),
+                    'laugh_sup': int(e.get('laugh_suppress_sec', 1.0) * self.fps),
+                }
+        except Exception as e:
+            logging.warning(f"Config load error: {e}. Using defaults.")
+            return default
+
+    def set_last_frame(self, frame):
+        self._last_frame_rgb = frame.copy() if frame is not None else None
 
     def set_active_user(self, user_profile):
         self.user = user_profile
-        self.dynamic_ear_threshold = user_profile.ear_threshold if user_profile else 0.22
-        self.counters = {k: 0 for k in self.counters}
+        base_ear = user_profile.ear_threshold if user_profile else self.config['ear_low']
+        self.dynamic_ear_thresh = base_ear
+        self.config['ear_low'] = base_ear
+        self.config['ear_high'] = base_ear * 1.2
+        self._reset_state()
+
+    def _reset_state(self):
+        keys = [
+            'DROWSINESS', 'RECOVERY', 'YAW', 'YAWN_COOL',
+            'BLINK', 'EYES_CLOSED', 'SMILE_SUP', 'LAUGH_SUP'
+        ]
+        self.counters = {k: 0 for k in keys}
         self.episode['active'] = False
         self.states = {k: False for k in self.states}
-        self.logger.stop_alert()
-
-    def detect(self, current_ear, mar, mouth_expression, hands_data=None, face_center_norm=None):
-        self._update_expression_suppression(mouth_expression)
-        self._update_blink_counter(current_ear)
-        self._update_drowsiness_episode(current_ear)
-        self._update_yawn_state(mar, mouth_expression, hands_data, face_center_norm)
+        self.ear_history.clear()
         
+    def detect(self, ear, mar, expression, hands_data=None, face_center=None, pitch=None):
+        self.ear_history.append(ear)
+        self._detect_sudden_ear_drop()
+        self.states['EYES_CLOSED'] = ear < self.config['ear_low']
+
+        # Update suppressions and events
+        self._update_suppression(expression)
+        self._update_blink(ear)
+        self._update_drowsiness(ear)
+        self._update_yawn(mar, expression, hands_data, face_center)
+
         if self.states['IS_DROWSY']:
-            self.logger.alert("critical")
-            return "DROWSY", (255, 0, 0)
-        elif self.states['IS_YAWNING']:
-            self.logger.alert("warning")
-            return "YAWNING", (255, 255, 0)
+            return "DROWSY", (0, 0, 255)
+        if self.states['IS_YAWNING']:
+            return "YAWNING", (0, 255, 255)
+        return "NORMAL", (0, 255, 0)
+
+    def _detect_sudden_ear_drop(self):
+        if len(self.ear_history) < 15:
+            return
+        drop = self.ear_history[-15] - self.ear_history[-1]
+        self.ear_drop_detected = (drop > self.config['ear_drop'])
+
+    def _update_suppression(self, expr):
+        if expr == "SMILE":
+            self.counters['SMILE_SUP'] = self.config['smile_sup']
+        elif expr == "LAUGH":
+            self.counters['LAUGH_SUP'] = self.config['laugh_sup']
         else:
-            self.logger.stop_alert()
-            return "NORMAL", (0, 255, 0)
+            if self.counters['SMILE_SUP'] > 0:
+                self.counters['SMILE_SUP'] -= 1
+            if self.counters['LAUGH_SUP'] > 0:
+                self.counters['LAUGH_SUP'] -= 1
 
-    def _update_expression_suppression(self, expr):
-        if expr == "SMILE": self.counters['SMILE_SUPPRESS_COUNTER'] = self.config.smile_suppress_frames
-        elif expr == "LAUGH": self.counters['LAUGH_SUPPRESS_COUNTER'] = self.config.laugh_suppress_frames
-        else: 
-            self.counters['SMILE_SUPPRESS_COUNTER'] = max(0, self.counters['SMILE_SUPPRESS_COUNTER'] - 1)
-            self.counters['LAUGH_SUPPRESS_COUNTER'] = max(0, self.counters['LAUGH_SUPPRESS_COUNTER'] - 1)
+    def _update_drowsiness(self, ear):
+        is_suppressed = self.counters['SMILE_SUP'] > 0 or self.counters['LAUGH_SUP'] > 0
 
-    def _update_drowsiness_episode(self, ear):
-        # Precompute thresholds once per user, not every frame
-        if not hasattr(self, '_ear_low'):
-            self._ear_low = self.dynamic_ear_threshold * 1.0
-            self._ear_high = self.dynamic_ear_threshold * 1.2
-
-        is_suppressed = self.counters['SMILE_SUPPRESS_COUNTER'] > 0 or self.counters['LAUGH_SUPPRESS_COUNTER'] > 0
-        low = ear < self._ear_low
-        high = ear >= self._ear_high
-        
         if self.episode['active']:
             self.episode['min_ear'] = min(self.episode['min_ear'], ear)
-            if high or is_suppressed:
-                self.counters['DROWSY_RECOVERY_FRAMES'] += 1
-                if self.counters['DROWSY_RECOVERY_FRAMES'] >= self.config.drowsy_end_grace_frames:
-                    duration = time.time() - self.episode['start_time']
-                    if duration >= self.config.min_episode_sec:
-                        self.logger.log_event(self.user.user_id if self.user else 0, "DROWSINESS_EPISODE", duration, self.episode['min_ear'], self.episode['start_frame_rgb'])
+            if ear >= self.config['ear_high'] or is_suppressed:
+                self.counters['RECOVERY'] += 1
+                if self.counters['RECOVERY'] >= self.config['drowsy_end']:
+                    dur = time.time() - self.episode['start_time']
+                    if dur >= self.config['min_episode_sec']:
+                        self.logger.log_event(
+                            getattr(self.user, 'user_id', 0),
+                            "DROWSINESS_EPISODE",
+                            dur,
+                            self.episode['min_ear'],
+                            self.episode['start_frame']
+                        )
                     self.episode['active'] = False
-            else: self.counters['DROWSY_RECOVERY_FRAMES'] = 0
+                    self.counters['DROWSINESS'] = 0
+            else:
+                self.counters['RECOVERY'] = 0
+        elif ear < self.config['ear_low'] and not is_suppressed:
+            self.counters['DROWSINESS'] += 1
+            if self.counters['DROWSINESS'] >= self.config['drowsy_start']:
+                self.episode.update({'active': True, 'start_time': time.time(), 'start_frame': self._last_frame_rgb, 'min_ear': 1.0})
+                self.counters['RECOVERY'] = 0
         else:
-            if low and not is_suppressed:
-                self.counters['DROWSINESS_FRAMES'] += 1
-                if self.counters['DROWSINESS_FRAMES'] >= self.config.drowsy_start_frames:
-                    self.episode.update({'active': True, 'start_time': time.time(), 'start_frame_rgb': self._last_frame_rgb.copy() if self._last_frame_rgb is not None else None, 'min_ear': 1.0})
-            else: self.counters['DROWSINESS_FRAMES'] = 0
+            self.counters['DROWSINESS'] = 0
+
         self.states['IS_DROWSY'] = self.episode['active']
 
-    def _update_blink_counter(self, ear):
-        if ear < self.dynamic_ear_threshold: self.counters['EYE_CLOSED_FRAMES'] += 1
+    def _update_blink(self, ear):
+        if ear < self.dynamic_ear_thresh:
+            self.counters['EYES_CLOSED'] += 1
         else:
-            if self.counters['EYE_CLOSED_FRAMES'] >= self.config.blink_closed_frames: self.counters['BLINK_COUNT'] += 1
-            self.counters['EYE_CLOSED_FRAMES'] = 0
+            if 0 < self.counters['EYES_CLOSED'] < 10:
+                self.counters['BLINK'] += 1
+            self.counters['EYES_CLOSED'] = 0
 
-    def _update_yawn_state(self, mar, expr, hands_data, face_center_norm):
-        if self.counters['YAWN_COOLDOWN'] > 0: self.counters['YAWN_COOLDOWN'] -= 1
-        
-        is_hand_covering_mouth = False
-        if hands_data and face_center_norm:
-            fx, fy = face_center_norm
-            for hand_landmarks in hands_data:
-                # Check Middle Finger MCP (Index 9) or Wrist (0) distance to Nose
-                # Simple distance check: < 0.15 normalized units implies hand is ON face
-                hx, hy, _ = hand_landmarks[9] 
-                dist = ((hx - fx)**2 + (hy - fy)**2)**0.5
-                if dist < 0.15:
-                    is_hand_covering_mouth = True
+    def _update_yawn(self, mar, expr, hands, face):
+        if self.counters['YAWN_COOL'] > 0:
+            self.counters['YAWN_COOL'] -= 1
+            self.states['IS_YAWNING'] = False
+            return
+
+        covered = False
+        if hands and face:
+            for h in hands:
+                if math.sqrt((h[12][0]-face[0])**2 + (h[12][1]-face[1])**2) < 0.15:
+                    covered = True
                     break
 
-        # Trigger yawn if:
-        # 1. MAR/Expression says YAWN
-        # 2. OR Hand is covering mouth AND Expression isn't explicitly "Smile/Laugh"
-        is_yawning_signal = (expr == "YAWN") or (is_hand_covering_mouth and expr not in ["SMILE", "LAUGH"])
-        
-        self.counters['YAWN_FRAMES'] = (self.counters['YAWN_FRAMES'] + 1) if is_yawning_signal else 0
-        
-        # We might want a slightly shorter threshold for hand-yawns as they are harder to catch
-        threshold = self.config.yawn_threshold_frames
-        
-        is_yawning = self.counters['YAWN_FRAMES'] >= threshold
-        
-        if is_yawning and not self.states['IS_YAWNING'] and self.counters['YAWN_COOLDOWN'] == 0:
-            event_type = "YAWN_COVERED" if is_hand_covering_mouth else "YAWN"
-            self.logger.log_event(self.user.user_id if self.user else 0, event_type, 0.0, mar, self._last_frame_rgb)
-            self.counters['YAWN_COOLDOWN'] = self.config.yawn_cooldown_frames
-        
-        self.states['IS_YAWNING'] = is_yawning
+        if (expr == "YAWN") or (covered and expr not in ["SMILE", "LAUGH"]):
+            self.counters['YAWN'] += 1
+        else:
+            self.counters['YAWN'] = 0
+
+        if self.counters['YAWN'] >= self.config['yawn_thresh']:
+            if not self.states['IS_YAWNING']:
+                self.logger.log_event(
+                    getattr(self.user, 'user_id', 0),
+                    "YAWN_COVERED" if covered else "YAWN",
+                    0.0,
+                    mar,
+                    self._last_frame_rgb
+                )
+                self.counters['YAWN_COOL'] = self.config['yawn_cool']
+                self.states['IS_YAWNING'] = True
+
+    def get_detailed_state(self):
+        return {
+            'is_drowsy': self.states['IS_DROWSY'],
+            'is_yawning': self.states['IS_YAWNING'],
+            'ear_trend': "STABLE"
+        }

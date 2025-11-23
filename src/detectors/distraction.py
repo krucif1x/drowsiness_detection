@@ -1,199 +1,152 @@
 import time
 import logging
+import math
+import yaml
 from collections import deque
 
 log = logging.getLogger(__name__)
 
 class DistractionDetector:
     """
-    Detects driver distraction using ABSOLUTE head pose thresholds.
+    Focused on distraction only: gaze direction thresholds and hand/phone/eating/wheel context.
+    Any fainting detection is handled by FaintingDetector externally.
     """
-    
-    # --- UPDATED THRESHOLDS (More permissive) ---
-    # Widened to prevent false positives for normal head movement
-    
-    YAW_THRESH = 45.0           # Was 40.0. 45 allows checking side mirrors.
-    PITCH_DOWN_THRESH = 25.0    # Was 20.0. 25 allows looking at speedometer.
-    PITCH_UP_THRESH = 25.0      # Was 20.0.
-    ROLL_THRESH = 35.0          # Was 30.0. Allows relaxing neck.
-    
-    TIME_THRESH = 2.5           
-    
-    # Defaults (Can be adjusted via keyboard shortcuts in detection_loop)
-    EXPECTED_PITCH = 0.0        
-    EXPECTED_YAW = 0.0          
-    EXPECTED_ROLL = 0.0         
-    
-    STABILIZATION_FRAMES = 5
-    
-    # --- NEW HAND ZONES (Normalized 0.0 to 1.0) ---
-    # Phone: Upper 50% of screen, Outer 25% of width
-    PHONE_ZONE_Y_MAX = 0.5 
-    PHONE_ZONE_X_LEFT = 0.25
-    PHONE_ZONE_X_RIGHT = 0.75
-    
-    # Wheel: Bottom 40% of screen
-    WHEEL_ZONE_Y_MIN = 0.6
 
-    def __init__(self, camera_pitch_offset: float = 0.0, camera_yaw_offset: float = 0.0):
-        self.start_time = None
+    def __init__(self, fps=30.0, camera_pitch=0.0, camera_yaw=0.0, config_path="config/detector_config.yaml"):
+        self.cfg = self._load_config(config_path, fps)
+        self.fps = fps
+
+        # State
         self.is_distracted = False
-        
-        # Apply offsets
-        self.EXPECTED_PITCH = camera_pitch_offset
-        self.EXPECTED_YAW = camera_yaw_offset
-        
-        self.history = deque(maxlen=self.STABILIZATION_FRAMES)
-        self.frame_count = 0
-        self.total_distractions = 0
-        
-        # New state for hands
-        self.is_holding_phone = False
-        self.hands_on_wheel = 0
-        
-        log.info(
-            f"DistractionDetector ready (Absolute Thresholds)\n"
-            f"  Baseline: P={self.EXPECTED_PITCH:.1f} Y={self.EXPECTED_YAW:.1f}\n"
-            f"  Limits: Yaw=±{self.YAW_THRESH} P_Down=+{self.PITCH_DOWN_THRESH} P_Up=-{self.PITCH_UP_THRESH}"
-        )
+        self.distraction_type = "NORMAL"
+        self.start_time = None
 
-    def _is_valid_pose(self, pitch: float, yaw: float, roll: float) -> bool:
-        return (
-            abs(pitch) < 90 and 
-            abs(yaw) < 90 and 
-            abs(roll) < 90 and
-            not (pitch == 0 and yaw == 0 and roll == 0)
-        )
-        
-    def detect_hand_distractions(self, hands_data):
-        """
-        Analyzes hand positions with improved sensitivity.
-        """
-        phone_detected = False
-        hands_on_wheel_count = 0
+        # Calibration
+        self.cal = {'pitch': camera_pitch, 'yaw': camera_yaw, 'roll': 0.0}
 
-        # DEBUG: Uncomment this line to prove data is arriving!
-        # if hands_data: log.info(f"Hands detected: {len(hands_data)}")
+        # History Buffers
+        self.history = deque(maxlen=5)
 
-        if not hands_data:
-            self.hands_on_wheel = 0
-            self.is_holding_phone = False
+        # Context Trackers (no fainting state here)
+        self.context = {'phone': False, 'eating': False, 'wheel': 0, 'drowsy': False, 'eyes_closed': False}
+        self.metrics = {'total_distractions': 0}
+
+        log.info("DistractionDetector initialized (Distraction-only)")
+
+    def _load_config(self, path, fps):
+        defaults = {
+            'yaw': 50.0,
+            'pitch_down': 28.0,
+            'pitch_up': 25.0,
+            'roll': 40.0,
+            'phone_min': 18.0,
+            'phone_max': 38.0,
+            't_gaze': 2.5,
+            't_phone': 1.0,
+            't_face': 2.0,
+            'zone_phone_y': 0.55,
+            'zone_phone_x': 0.25,
+            'zone_wheel_y': 0.65
+        }
+        try:
+            with open(path, 'r') as f:
+                raw = yaml.safe_load(f) or {}
+                distraction_cfg = raw.get('distraction', {})
+                return {
+                    'yaw': distraction_cfg.get('yaw_threshold', defaults['yaw']),
+                    'pitch_down': distraction_cfg.get('pitch_down_threshold', defaults['pitch_down']),
+                    'pitch_up': distraction_cfg.get('pitch_up_threshold', defaults['pitch_up']),
+                    'roll': distraction_cfg.get('roll_threshold', defaults['roll']),
+                    'phone_min': distraction_cfg.get('phone_pitch_min', defaults['phone_min']),
+                    'phone_max': distraction_cfg.get('phone_pitch_max', defaults['phone_max']),
+                    't_gaze': distraction_cfg.get('time_gaze', defaults['t_gaze']),
+                    't_phone': distraction_cfg.get('time_phone', defaults['t_phone']),
+                    't_face': distraction_cfg.get('time_hand_face', defaults['t_face']),
+                    'zone_phone_y': distraction_cfg.get('phone_zone_y_max', defaults['zone_phone_y']),
+                    'zone_phone_x': distraction_cfg.get('phone_zone_x_outer', defaults['zone_phone_x']),
+                    'zone_wheel_y': distraction_cfg.get('wheel_zone_y_min', defaults['zone_wheel_y'])
+                }
+        except Exception as e:
+            log.warning(f"Failed to load distraction config: {e}")
+            return defaults
+
+    def set_drowsiness_state(self, is_drowsy, eyes_closed):
+        self.context['drowsy'] = is_drowsy
+        self.context['eyes_closed'] = eyes_closed
+
+    def detect_hand_context(self, hands, face):
+        self.context.update({'phone': False, 'eating': False, 'wheel': 0})
+        if not hands:
             return
 
-        for hand_landmarks in hands_data:
-            # WRIST = Index 0
-            # MIDDLE_FINGER_TIP = Index 12
-            wrist = hand_landmarks[0]
-            finger = hand_landmarks[12]
-            
-            # 1. PHONE DETECTION
-            # Use FINGER TIP for height check (more sensitive than average)
-            # Relaxed X-zone: Check outer 30% (0.3 and 0.7) instead of 25%
-            if finger[1] < self.PHONE_ZONE_Y_MAX:
-                if finger[0] < 0.30 or finger[0] > 0.70:
-                    phone_detected = True
-                    # log.info(f"Phone Detected! Y:{finger[1]:.2f} X:{finger[0]:.2f}")
+        for h in hands:
+            wrist, finger = h[0], h[12]
+            if wrist[1] > self.cfg['zone_wheel_y']:
+                self.context['wheel'] += 1
+                continue
 
-            # 2. WHEEL DETECTION
-            # Use WRIST for wheel check (hand can be open or closed)
-            if wrist[1] > self.WHEEL_ZONE_Y_MIN:
-                hands_on_wheel_count += 1
+            is_high = finger[1] < self.cfg['zone_phone_y']
+            is_side = not (self.cfg['zone_phone_x'] < finger[0] < (1.0 - self.cfg['zone_phone_x']))
+            if is_high and is_side:
+                self.context['phone'] = True
+                continue
 
-        self.is_holding_phone = phone_detected
-        self.hands_on_wheel = hands_on_wheel_count
-    
-    def analyze(self, pitch: float, yaw: float, roll: float, hands_data: list = None) -> tuple[bool, bool]:
-        self.frame_count += 1
-        
-        # Run Hand Analysis if data is provided
-        if hands_data is not None:
-            self.detect_hand_distractions(hands_data)
-        
-        if not self._is_valid_pose(pitch, yaw, roll):
-            self.history.append(False)
+            if face and ((finger[0]-face[0])**2 + (finger[1]-face[1])**2) ** 0.5 < 0.15:
+                if not self.context['phone']:
+                    self.context['eating'] = True
+
+    def analyze(self, pitch, yaw, roll, hands=None, face=None):
+        """
+        Distraction decision only. Fainting must be handled by FaintingDetector separately.
+        Returns (is_distracted, is_new_event).
+        """
+        if not (abs(pitch) < 90 and abs(yaw) < 90):
             return False, False
-        
-        # Calculate deviation
-        delta_pitch = pitch - self.EXPECTED_PITCH
-        delta_yaw = abs(yaw - self.EXPECTED_YAW)
-        delta_roll = abs(roll - self.EXPECTED_ROLL)
 
-        is_bad_angle = False
+        self.detect_hand_context(hands, face)
+
+        dp, dy = pitch - self.cal['pitch'], abs(yaw - self.cal['yaw'])
         violations = []
-        
-        # -- HEAD POSE CHECKS --
-        # Check Yaw
-        if delta_yaw > self.YAW_THRESH:
-            is_bad_angle = True
-            violations.append(f"Yaw {delta_yaw:.0f}")
-        
-        # Check Pitch Down
-        if delta_pitch > self.PITCH_DOWN_THRESH:
-            is_bad_angle = True
-            violations.append(f"Down {delta_pitch:.0f}")
-        
-        # Check Pitch Up
-        if delta_pitch < -self.PITCH_UP_THRESH:
-            is_bad_angle = True
-            violations.append(f"Up {abs(delta_pitch):.0f}")
-        
-        # Check Roll
-        if delta_roll > self.ROLL_THRESH:
-            is_bad_angle = True
-            violations.append(f"Roll {delta_roll:.0f}")
-            
-        # --- HAND DISTRACTION CHECKS ---
-        if self.is_holding_phone:
-            is_bad_angle = True
-            violations.append("HOLDING PHONE")
-            
-            
-        self.history.append(is_bad_angle)
-        is_stable_distraction = sum(self.history) >= 3
+        if self.context['phone']:
+            violations.append("PHONE")
+        elif dp > self.cfg['pitch_down']:
+            violations.append("LOOKING DOWN")
+        elif dy > self.cfg['yaw']:
+            violations.append("LOOKING ASIDE")
+        elif dp < -self.cfg['pitch_up']:
+            violations.append("LOOKING UP")
+        elif self.context['eating'] and "PHONE" not in violations:
+            violations.append("HAND ON FACE")
 
-        if is_stable_distraction:
+        self.history.append(len(violations) > 0)
+        if sum(self.history) >= 3:
             if self.start_time is None:
                 self.start_time = time.time()
-            
             elapsed = time.time() - self.start_time
-            
-            if elapsed > self.TIME_THRESH:
+            # Choose timer by type
+            if "PHONE" in violations:
+                limit = self.cfg['t_phone']
+            elif "HAND ON FACE" in violations:
+                limit = self.cfg['t_face']
+            else:
+                limit = self.cfg['t_gaze']
+
+            if elapsed > limit:
                 if not self.is_distracted:
                     self.is_distracted = True
-                    self.total_distractions += 1
-                    log.warning(f"🚨 DISTRACTION: {', '.join(violations)}")
-                    return True, True  
-                return True, False  
-            return True, False 
-        
-        else:
-            if self.start_time is not None:
-                self.start_time = None
-            self.is_distracted = False
+                    self.metrics['total_distractions'] += 1
+                    self.distraction_type = violations[0] if violations else "DISTRACTED"
+                    return True, True
+                return True, False
             return False, False
-    
-    def get_status(self, pitch, yaw, roll):
-        # Helper for UI Debugging
-        
-        status = super().get_status(pitch, yaw, roll) if hasattr(super(), 'get_status') else {}
+        else:
+            self.start_time = None
+            self.is_distracted = False
+            self.distraction_type = "NORMAL"
+            return False, False
+
+    def get_status(self, p, y, r):
         return {
-            'deltas': {'pitch': pitch - self.EXPECTED_PITCH, 'yaw': abs(yaw - self.EXPECTED_YAW), 'roll': abs(roll)},
             'is_distracted': self.is_distracted,
-            'distraction_duration': time.time() - self.start_time if self.start_time else 0,
-            'total_distractions': self.total_distractions,
-            'hands': {
-                'holding_phone': self.is_holding_phone,
-                'on_wheel_count': self.hands_on_wheel
-            }
+            'type': self.distraction_type
         }
-    
-    def adjust_camera_offset(self, pitch_offset: float = None, yaw_offset: float = None):
-        if pitch_offset is not None:
-            self.EXPECTED_PITCH = pitch_offset
-            log.info(f"Camera pitch offset adjusted to {pitch_offset:.1f}")
-        if yaw_offset is not None:
-            self.EXPECTED_YAW = yaw_offset
-            log.info(f"Camera yaw offset adjusted to {yaw_offset:.1f}")
-    
-    def get_statistics(self):
-        return {'total_distractions': self.total_distractions}

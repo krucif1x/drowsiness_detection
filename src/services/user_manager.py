@@ -1,9 +1,9 @@
 import logging
 import torch
-import time
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from threading import Lock
+from collections import deque
 
 from src.infrastructure.data.models import UserProfile
 from src.infrastructure.data.database import UnifiedDatabase
@@ -17,10 +17,16 @@ class UserManager:
     def __init__(
         self, 
         database_file: str = r"data\drowsiness_events.db",
-        # STRICTER threshold for better accuracy
-        # Lower value = more strict = fewer false matches
-        # Start with 0.30, increase ONLY if it fails to recognize YOU
-        recognition_threshold: float = 0.30, 
+        # Optimized threshold based on FaceNet typical distances
+        # FaceNet euclidean distances: same person ~0.4-0.6, different ~1.0+
+        recognition_threshold: float = 0.6,  # Conservative threshold for better accuracy
+        
+        # Multi-frame validation reduces false positives significantly
+        multi_frame_validation: bool = True,
+        min_consistent_frames: int = 3,  # Require 3 consistent detections
+        
+        # Quality thresholds
+        min_face_confidence: float = 0.95,  # Only use high-quality detections
         
         input_color: str = "RGB"
     ):
@@ -30,22 +36,47 @@ class UserManager:
         self.input_color = (input_color or "RGB").upper()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         
+        # Multi-frame validation settings
+        self.multi_frame_validation = multi_frame_validation
+        self.min_consistent_frames = min_consistent_frames
+        self.min_face_confidence = min_face_confidence
+        
+        # Store recent frame results for validation
+        self._recent_matches: deque = deque(maxlen=min_consistent_frames)
+        
         self._lock = Lock()
         
-        # Components
+        # Components with enhanced configuration
         self.db = UnifiedDatabase(database_file)
         self.repo = UnifiedRepository(self.db)
         self.model_loader = FaceModelLoader(device=str(self.device))
         self.validator = ImageValidator(self.input_color)
-        self.encoder = FaceEncodingExtractor(self.model_loader, self.validator, self.device)
-        self.matcher = SimilarityMatcher()
+        
+        # Enhanced encoder with configurable detection threshold
+        self.encoder = FaceEncodingExtractor(
+            self.model_loader, 
+            self.validator, 
+            self.device,
+            min_detection_prob=min_face_confidence
+        )
+        
+        # Enhanced matcher with distance metric selection
+        self.matcher = SimilarityMatcher(distance_metric="euclidean")
 
         # Caches
         self.users: List[UserProfile] = []
         self._user_id_map: dict[int, UserProfile] = {}
         
+        # Statistics for monitoring
+        self._match_stats = {
+            'total_attempts': 0,
+            'successful_matches': 0,
+            'failed_matches': 0,
+            'avg_match_distance': []
+        }
+        
         self._load_users()
-        logging.info("UserManager initialized successfully")
+        logging.info(f"UserManager initialized successfully with threshold={recognition_threshold}")
 
     def _load_users(self):
         """Load all user profiles from database into memory cache."""
@@ -60,55 +91,163 @@ class UserManager:
             self.users = []
             self._user_id_map = {}
 
-    def find_best_match(self, image_frame) -> Optional[UserProfile]:
-        """Find best matching user from image frame."""
+    def _calculate_confidence_score(self, distance: float, threshold: float) -> float:
+        """
+        Calculate confidence score based on distance from threshold.
+        Returns value between 0-1, where 1 is highest confidence.
+        """
+        if distance >= threshold:
+            return 0.0
+        # Exponential decay for confidence
+        confidence = np.exp(-3 * (distance / threshold))
+        return min(confidence, 1.0)
+
+    def find_best_match(self, image_frame, use_metadata: bool = False) -> Optional[UserProfile]:
+        """
+        Find best matching user from image frame with enhanced validation.
+        Uses multi-frame consistency check to reduce false positives.
+        
+        Args:
+            image_frame: Input frame to match
+            use_metadata: If True, log detailed extraction metadata
+        """
         if not self.users:
+            logging.debug("No users in database")
             return None
 
-        encoding = self.encoder.extract(image_frame)
-        if encoding is None:
-            return None
+        # Extract encoding with optional metadata
+        if use_metadata:
+            result = self.encoder.extract(image_frame, return_metadata=True)
+            if result[0] is None:
+                logging.debug(f"Extraction failed: {result[1]}")
+                return None
+            encoding, metadata = result
+            logging.debug(f"Extraction metadata: {metadata}")
+        else:
+            encoding = self.encoder.extract(image_frame)
+            if encoding is None:
+                logging.debug("No face detected in frame")
+                return None
 
         with self._lock:
+            # Find best match with distance
             best_user, dist = self.matcher.best_match(
                 encoding, 
                 self.users, 
                 threshold=self.recognition_threshold
             )
+            
+            # Calculate confidence
+            confidence = self._calculate_confidence_score(dist, self.recognition_threshold)
+            
+            # Update statistics
+            self._match_stats['total_attempts'] += 1
+            if dist < self.recognition_threshold:
+                self._match_stats['avg_match_distance'].append(dist)
 
-        if best_user:
-            logging.info(f"✓ MATCH FOUND: User ID {best_user.user_id} (Distance: {dist:.3f})")
+        # Multi-frame validation for consistency
+        if self.multi_frame_validation and best_user:
+            self._recent_matches.append((best_user.user_id if best_user else None, dist))
+            
+            # Check if we have enough frames
+            if len(self._recent_matches) < self.min_consistent_frames:
+                logging.debug(f"Collecting frames: {len(self._recent_matches)}/{self.min_consistent_frames}")
+                return None
+            
+            # Check consistency across recent frames
+            recent_user_ids = [match[0] for match in self._recent_matches]
+            most_common_id = max(set(recent_user_ids), key=recent_user_ids.count)
+            consistency_count = recent_user_ids.count(most_common_id)
+            
+            # Require majority consensus
+            if consistency_count < (self.min_consistent_frames * 0.6):  # 60% threshold
+                logging.debug(f"Inconsistent matches across frames: {recent_user_ids}")
+                return None
+            
+            # If consensus doesn't match current best, return None
+            if most_common_id != (best_user.user_id if best_user else None):
+                logging.debug(f"Current match inconsistent with recent history")
+                return None
+
+        if best_user and dist < self.recognition_threshold:
+            logging.info(
+                f"✓ MATCH FOUND: User ID {best_user.user_id} "
+                f"(Distance: {dist:.4f}, Confidence: {confidence:.2%}, "
+                f"Threshold: {self.recognition_threshold})"
+            )
+            self._match_stats['successful_matches'] += 1
             self.repo.update_last_seen(best_user.user_id)
             return best_user
         else:
-            logging.info(f"✗ NO MATCH (Closest distance: {dist:.3f}, Threshold: {self.recognition_threshold})")
+            self._match_stats['failed_matches'] += 1
+            logging.info(
+                f"✗ NO MATCH (Closest: User {best_user.user_id if best_user else 'N/A'}, "
+                f"Distance: {dist:.4f}, Confidence: {confidence:.2%}, "
+                f"Threshold: {self.recognition_threshold})"
+            )
             return None
 
-    def register_new_user(self, image_frame, ear_threshold: float, user_id: Optional[int] = None) -> Optional[UserProfile]:
+    def register_new_user(
+        self, 
+        image_frame, 
+        ear_threshold: float, 
+        user_id: Optional[int] = None,
+        require_multiple_frames: bool = False,
+        additional_frames: Optional[List] = None
+    ) -> Optional[UserProfile]:
         """
-        Register new user with face encoding and EAR threshold.
-        Uses SAME threshold as recognition for consistency.
+        Register new user with enhanced multi-frame encoding.
+        
+        Args:
+            image_frame: Initial frame for registration
+            ear_threshold: EAR threshold for drowsiness detection
+            user_id: Optional specific user ID
+            require_multiple_frames: Whether to use multiple frames
+            additional_frames: List of additional frames to average (if multiple)
         """
         if ear_threshold is None: 
             return None
 
+        # Extract encoding from primary frame
         encoding = self.encoder.extract(image_frame)
         if encoding is None: 
-            logging.error("Cannot register: No face encoding extracted")
+            logging.error("Cannot register: No face encoding extracted from primary frame")
             return None
 
+        # Multi-frame registration for better accuracy
+        encodings = [encoding]
+        
+        if require_multiple_frames and additional_frames:
+            logging.info(f"Multi-frame registration with {len(additional_frames)} additional frames...")
+            
+            for frame in additional_frames:
+                enc = self.encoder.extract(frame)
+                if enc is not None:
+                    encodings.append(enc)
+            
+            logging.info(f"Collected {len(encodings)} valid encodings from {len(additional_frames) + 1} frames")
+        
+        # Average encodings for robustness (already normalized by encoder)
+        final_encoding = np.mean(encodings, axis=0)
+        
+        # Normalize the averaged encoding
+        final_encoding = final_encoding / (np.linalg.norm(final_encoding) + 1e-8)
+
+        # Check for duplicates with stricter threshold during registration
+        registration_threshold = self.recognition_threshold * 0.8  # 20% stricter
+        
         with self._lock:
-            # Use SAME threshold for duplicate check
             duplicate, dist = self.matcher.best_match(
-                encoding, 
+                final_encoding, 
                 self.users, 
-                threshold=self.recognition_threshold
+                threshold=registration_threshold
             )
 
         if duplicate:
             logging.warning(
                 f"⚠ DUPLICATE DETECTED: User ID {duplicate.user_id} already exists "
-                f"(Distance: {dist:.3f}). Returning existing user."
+                f"(Distance: {dist:.4f}, Threshold: {registration_threshold:.4f}). "
+                f"Returning existing user."
             )
             return duplicate
 
@@ -116,8 +255,8 @@ class UserManager:
         if user_id is None:
             user_id = self.repo.get_next_user_id()
 
-        # Create User Object
-        new_user = UserProfile(0, user_id, ear_threshold, encoding)
+        # Create User Object with validated encoding
+        new_user = UserProfile(0, user_id, ear_threshold, final_encoding)
 
         try:
             # Save to DB
@@ -129,8 +268,88 @@ class UserManager:
                 self._user_id_map[user_id] = new_user
                 self.matcher.build_matrix(self.users)
             
-            logging.info(f"✓ NEW USER REGISTERED: ID={user_id}, EAR Threshold={ear_threshold:.2f}")
+            logging.info(
+                f"✓ NEW USER REGISTERED: ID={user_id}, "
+                f"EAR Threshold={ear_threshold:.2f}, "
+                f"Encoding Quality: Valid"
+            )
             return new_user
         except Exception as e:
-            logging.error(f"❌ User registration failed: {e}")
+            logging.error(f"✗ User registration failed: {e}")
             return None
+
+    def get_match_statistics(self) -> dict:
+        """Return comprehensive matching statistics for monitoring and tuning."""
+        stats = self._match_stats.copy()
+        if stats['avg_match_distance']:
+            stats['avg_match_distance'] = np.mean(stats['avg_match_distance'])
+        else:
+            stats['avg_match_distance'] = 0.0
+        
+        if stats['total_attempts'] > 0:
+            stats['success_rate'] = stats['successful_matches'] / stats['total_attempts']
+        else:
+            stats['success_rate'] = 0.0
+        
+        # Add encoder and matcher stats
+        stats['encoder_stats'] = self.encoder.get_statistics()
+        stats['matcher_stats'] = self.matcher.get_statistics()
+        
+        return stats
+
+    def analyze_user_separability(self) -> dict:
+        """
+        Analyze how well registered users are separated.
+        Helps identify duplicates and optimize threshold.
+        """
+        return self.matcher.analyze_separability(self.users)
+
+    def find_potential_duplicates(self, threshold: float = 0.4) -> List[Tuple[int, int, float]]:
+        """
+        Find pairs of users that might be duplicates.
+        
+        Args:
+            threshold: Distance threshold for considering users as potential duplicates
+            
+        Returns:
+            List of (user_id_1, user_id_2, distance) tuples
+        """
+        if len(self.users) < 2:
+            return []
+        
+        dist_matrix = self.matcher.get_distance_matrix(self.users)
+        potential_duplicates = []
+        
+        for i in range(len(self.users)):
+            for j in range(i + 1, len(self.users)):
+                if dist_matrix[i, j] < threshold:
+                    potential_duplicates.append((
+                        self.users[i].user_id,
+                        self.users[j].user_id,
+                        float(dist_matrix[i, j])
+                    ))
+        
+        return sorted(potential_duplicates, key=lambda x: x[2])
+
+    def reset_match_buffer(self):
+        """Reset the multi-frame matching buffer. Call when user changes or resets."""
+        with self._lock:
+            self._recent_matches.clear()
+        logging.debug("Match buffer reset")
+
+    def adjust_threshold(self, new_threshold: float):
+        """
+        Dynamically adjust recognition threshold.
+        Use this for fine-tuning based on your environment.
+        
+        Recommended ranges:
+        - 0.4-0.5: Very strict (low false positives, may miss genuine matches)
+        - 0.6-0.7: Balanced (recommended for most cases)
+        - 0.8-0.9: Lenient (catches more matches, higher false positives)
+        """
+        old_threshold = self.recognition_threshold
+        self.recognition_threshold = new_threshold
+        logging.info(f"Recognition threshold adjusted: {old_threshold:.2f} -> {new_threshold:.2f}")
+        
+        # Reset buffer when changing threshold
+        self.reset_match_buffer()

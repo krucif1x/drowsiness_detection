@@ -13,6 +13,7 @@ from src.mediapipe.head_pose import HeadPoseEstimator
 from src.mediapipe.hand import MediaPipeHandsWrapper
 from src.detectors.drowsiness import DrowsinessDetector
 from src.detectors.distraction import DistractionDetector
+from src.detectors.fainting import FaintingDetector  # NEW: integrate fainting
 from src.detectors.expression import MouthExpressionClassifier 
 
 log = logging.getLogger(__name__)
@@ -25,21 +26,34 @@ class DetectionLoop:
         self.logger = system_logger
         self.visualizer = Visualizer()
         
-        # Initialize Core Calibrator (using main_logic.py)
+        # Initialize Core Calibrator
         self.ear_calibrator = EARCalibrator(self.camera, self.face_mesh, self.user_manager)
         
         # Initialize Detectors
         self.detector = DrowsinessDetector(self.logger, fps, detector_config_path)
         
-        # ABSOLUTE THRESHOLD DISTRACTION DETECTOR
-        # We start with 0.0 offset. You can adjust this with +/- keys while running.
+        # Initialize Distraction Detector
         self.distraction_detector = DistractionDetector(
-            camera_pitch_offset=0.0,  
-            camera_yaw_offset=0.0     
+            fps=fps,
+            camera_pitch=0.0,  
+            camera_yaw=0.0,
+            config_path=detector_config_path
         )
+        
+        # NEW: Fainting detector
+        self.fainting_detector = FaintingDetector(
+            fps=fps,
+            camera_pitch=0.0,
+            config_path=detector_config_path
+        )
+        
+        # Link detectors for Fainting Logic (legacy note kept; fainting is now separate)
+        self.detector.set_last_frame(None)  # ensure safe default
         
         self.head_pose_estimator = HeadPoseEstimator()
         self.expression_classifier = MouthExpressionClassifier()
+        
+        # Hand Wrapper (Max 2 hands)
         self.hand_wrapper = MediaPipeHandsWrapper(max_num_hands=2)
         
         # Calculators
@@ -57,12 +71,17 @@ class DetectionLoop:
         self._frame_idx = 0
         self._show_debug_deltas = False 
         
-        # NEW: Buffer to prevent instant calibration
+        # Buffer to prevent instant calibration
         self.recognition_patience = 0
-        self.RECOGNITION_THRESHOLD = 45  # Wait ~1.5 seconds before assuming new user
+        self.RECOGNITION_THRESHOLD = 45  # ~1.5 seconds
+
+        # --- OPTIMIZATION VARIABLES ---
+        self.HAND_INFERENCE_INTERVAL = 5     # Run hand detection every 5 frames
+        self.USER_SEARCH_INTERVAL = 30       # Search for user every 30 frames (1 sec)
+        self._cached_hands_data = []         # Store hand data for skipped frames
 
     def run(self):
-        log.info("Starting Detection Loop...")
+        log.info("Starting Optimized Detection Loop...")
         log.info("Shortcuts: Q=Quit | D=Debug | +/- = Adjust Pitch")
         try:
             while True:
@@ -74,11 +93,16 @@ class DetectionLoop:
                 elif key == ord('d'):
                     self._show_debug_deltas = not self._show_debug_deltas
                 elif key == ord('+') or key == ord('='):
-                    current = self.distraction_detector.EXPECTED_PITCH
-                    self.distraction_detector.adjust_camera_offset(pitch_offset=current + 2.0)
+                    current = self.distraction_detector.cfg.get('pitch', 0.0) # Access via cfg if refactored, else attribute
+                    if hasattr(self.distraction_detector, 'cal'):
+                        self.distraction_detector.cal['pitch'] += 2.0
+                        self.fainting_detector.cal['pitch'] = self.distraction_detector.cal['pitch']
+                        log.info(f"Adjusted camera pitch cal to {self.distraction_detector.cal['pitch']:.1f}")
                 elif key == ord('-') or key == ord('_'):
-                    current = self.distraction_detector.EXPECTED_PITCH
-                    self.distraction_detector.adjust_camera_offset(pitch_offset=current - 2.0)
+                    if hasattr(self.distraction_detector, 'cal'):
+                        self.distraction_detector.cal['pitch'] -= 2.0
+                        self.fainting_detector.cal['pitch'] = self.distraction_detector.cal['pitch']
+                        log.info(f"Adjusted camera pitch cal to {self.distraction_detector.cal['pitch']:.1f}")
         finally:
             # Cleanup resources
             self.hand_wrapper.close()
@@ -88,20 +112,32 @@ class DetectionLoop:
         frame = self.camera.read()
         if frame is None: return
         
+        # Increment frame counter
+        self._frame_idx += 1
+        
         fps = self.fps_tracker.update()
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 1. Run MediaPipe Face Mesh (Must run every frame for EAR/Gaze)
         results = self.face_mesh.process(frame_rgb)
-        hands_data = self.hand_wrapper.infer(frame_rgb, preprocessed=True)
+        
+        # 2. Run MediaPipe Hands (OPTIMIZED: Throttled)
+        if self._frame_idx % self.HAND_INFERENCE_INTERVAL == 0:
+            self._cached_hands_data = self.hand_wrapper.infer(frame_rgb, preprocessed=True)
+        
+        # Use cached data for this frame (normalized 0–1 coordinates)
+        hands_data = self._cached_hands_data
+        
         display = frame.copy()
 
         if self.current_mode == 'DETECTING':
-            self._handle_detecting(frame, display, results, hands_data,fps)
+            self._handle_detecting(frame, display, results, hands_data, fps)
         elif self.current_mode == 'WAITING_FOR_USER':
             self._handle_waiting(frame, display, results)
         
         cv2.imshow("Drowsiness System", cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
 
-    def _handle_detecting(self, frame, display, results, hands_data,fps):
+    def _handle_detecting(self, frame, display, results, hands_data, fps):
         if not results.multi_face_landmarks: 
             self.visualizer.draw_no_face_text(display)
             return
@@ -109,126 +145,171 @@ class DetectionLoop:
         h, w = frame.shape[:2]
         raw_lms = results.multi_face_landmarks[0]
         
-        #1. calculate Head Pose
+        # --- DATA EXTRACTION ---
+        
+        # 1. Head Pose
         pose = self.head_pose_estimator.calculate_pose(raw_lms, w, h)
-        pitch, yaw, roll = pose if pose else (0, 0, 0)
+        pitch, yaw, roll = pose if pose else (0.0, 0.0, 0.0)
         
-        #2. Extract Eye/Mouth/Nose Data
+        # 2. Face Landmarks (Pixels)
         lms = [(int(l.x*w), int(l.y*h)) for l in raw_lms.landmark]
-        coords = {'left_eye': [lms[i] for i in L_EAR], 'right_eye': [lms[i] for i in R_EAR], 'mouth': [lms[i] for i in M_MAR]}
+        coords = {
+            'left_eye': [lms[i] for i in L_EAR], 
+            'right_eye': [lms[i] for i in R_EAR], 
+            'mouth': [lms[i] for i in M_MAR]
+        }
         
-        # Extract Nose Tip (Landmark 1) for Hand-Over-Mouth calculation
-        # Normalized coordinates (0.0 - 1.0)
+        # 3. Face Center (Normalized, 0–1)
         nose_tip = raw_lms.landmark[1]
         face_center_norm = (nose_tip.x, nose_tip.y)
         
-        left = self.ear_calculator.calculate(coords['left_eye'])
-        right = self.ear_calculator.calculate(coords['right_eye'])
+        # 4. Metrics Calculation
+        left = self.ear_calibrator.ear_calculator.calculate(coords['left_eye'])
+        right = self.ear_calibrator.ear_calculator.calculate(coords['right_eye'])
         mar = self.mar_calculator.calculate(coords['mouth'])
         ear = (left + right) / 2.0
         avg_ear = self.ear_smoother.update(ear)
-        expr = self.expression_classifier.classify(lms, h)
+        
+        # 5. Expression Classification (pass normalized info properly)
+        # Optimize call: supply mouth landmarks in pixels and img_h for quick ratios.
+        expr = self.expression_classifier.classify(
+            lms, 
+            h, 
+            hands_data=hands_data
+        )
 
+        # Update last frame for logging in drowsiness
         self.detector.set_last_frame(frame)
         
-        # 3. Detect Drowsiness (Now includes Hands & Face Center)
+        # 6. Detect Drowsiness
         drowsy_status, drowsy_color = self.detector.detect(
             avg_ear, mar, expr, 
             hands_data=hands_data, 
-            face_center_norm=face_center_norm
+            face_center=face_center_norm,
+            pitch=pitch 
         )
-        
-        # 4. Detect Distraction (Now includes Hands & Face Center)
-        looking_away, should_log_distraction = self.distraction_detector.analyze(
-            pitch, yaw, roll, 
-            hands_data=hands_data
+        drowsy_state = self.detector.get_detailed_state()
+        is_drowsy = drowsy_state.get('is_drowsy', False)
+        eyes_closed = self.detector.states.get('EYES_CLOSED', False)
+
+        # 7. Distraction (sets its own context including phone/eating/wheel)
+        is_distracted, should_log_distraction = self.distraction_detector.analyze(
+            pitch, yaw, roll,
+            hands=hands_data,
+            face=face_center_norm
         )
-        
-        # --- STATUS LOGIC ---
+
+        # 8. Fainting: feed context and analyze
+        # Context from distraction + drowsiness
+        phone_flag = self.distraction_detector.context.get('phone', False)
+        wheel_count = self.distraction_detector.context.get('wheel', 0)
+        self.fainting_detector.set_context(
+            drowsy=is_drowsy,
+            eyes_closed=eyes_closed,
+            phone=phone_flag,
+            wheel_count=wheel_count
+        )
+        is_fainting, faint_is_new = self.fainting_detector.analyze(
+            pitch=pitch, yaw=yaw, roll=roll, hands=hands_data, face_center=face_center_norm
+        )
+
+        # --- STATUS & UI LOGIC ---
         final_status = drowsy_status
         final_color = drowsy_color
 
         if "CALIBRATING" in drowsy_status:
             final_status = drowsy_status 
             final_color = (255, 255, 0)
-            if looking_away:
+            if is_distracted:
                 cv2.putText(display, "LOOK FORWARD", (w//2 - 100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-
-        elif "SLEEP" in drowsy_status or "YAWN" in drowsy_status:
+        elif is_fainting:
+            final_status = "FAINTING!"
+            final_color = (255, 0, 255)
+            if faint_is_new:
+                self.logger.alert("fainting")
+                self.logger.log_event(
+                    getattr(self.user, 'user_id', 0),
+                    "FAINTING",
+                    0.0,
+                    float(self.fainting_detector.faint_probability),
+                    frame
+                )
+        elif "SLEEP" in drowsy_status or "YAWN" in drowsy_status or "DROWSY" in drowsy_status:
             pass
-
-        elif looking_away:
-            # Check SPECIFIC Distraction Types
-            if self.distraction_detector.is_holding_phone:
+        elif is_distracted:
+            reason = self.distraction_detector.distraction_type
+            
+            if reason == "PHONE":
                 final_status = "PHONE DETECTED!"
                 final_color = (0, 0, 255)
-            else:
-                final_status = "LOOKING AWAY"
+            elif "HAND" in reason or "EATING" in reason:
+                final_status = "HAND ON FACE"
+                final_color = (0, 200, 255)
+            elif "ASIDE" in reason:
+                final_status = "LOOKING ASIDE"
                 final_color = (0, 255, 255)
+            elif "DOWN" in reason:
+                final_status = "EYES ON ROAD"
+                final_color = (0, 255, 255)
+            else:
+                final_status = "DISTRACTED"
+                final_color = (0, 0, 255)
             
             if should_log_distraction:
-                if final_status == "LOOKING AWAY":
-                    final_status = "DISTRACTED!"
-                final_color = (0, 0, 255)
                 self.logger.alert("distraction")
-                self.logger.log_event(self.user.user_id, "DISTRACTION", 2.5, 0.0, frame)
+                self.logger.log_event(self.user.user_id, f"DISTRACTION_{reason}", 2.5, 0.0, frame)
         
-        # 5. Visualization
+        # --- VISUALIZATION ---
         self.visualizer.draw_landmarks(display, coords)
+        
         # Debug Text
         cv2.putText(display, f"P:{int(pitch)} Y:{int(yaw)} R:{int(roll)}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
-        # Show Hands on Wheel count for debugging
-        hands_count = self.distraction_detector.hands_on_wheel
+        # Debug Hand Status
+        hands_count = self.distraction_detector.context.get('wheel', 0) if hasattr(self.distraction_detector, 'context') else 0
         cv2.putText(display, f"Hands on Wheel: {hands_count}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if hands_count >= 2 else (0, 165, 255), 1)
         
-        
+        # Faint prob debug
+        faint_prob = getattr(self.fainting_detector, 'faint_probability', 0.0)
+        cv2.putText(display, f"FaintProb: {faint_prob:.2f}", (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 120, 255), 1)
+
         if self._show_debug_deltas:
             self._draw_debug_panel(display, pitch, yaw, roll, w, h)
         
-        self.visualizer.draw_detection_hud(display, f"User {self.user.user_id}", final_status, final_color, fps, avg_ear, mar, 0, expr, (pitch, yaw, roll))
+        user_label = f"User {self.user.user_id}" if self.user else "User ?"
+        self.visualizer.draw_detection_hud(display, user_label, final_status, final_color, fps, avg_ear, mar, 0, expr, (pitch, yaw, roll))
 
     def _draw_debug_panel(self, display, pitch, yaw, roll, w, h):
-        # Simple debug visualization
         y_start = h - 150
-        cv2.putText(display, f"Exp Pitch: {self.distraction_detector.EXPECTED_PITCH:.1f}", (10, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(display, f"Exp Yaw: {self.distraction_detector.EXPECTED_YAW:.1f}", (10, y_start + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        exp_p = self.distraction_detector.cal['pitch'] if hasattr(self.distraction_detector, 'cal') else 0.0
+        exp_y = self.distraction_detector.cal['yaw'] if hasattr(self.distraction_detector, 'cal') else 0.0
+        
+        cv2.putText(display, f"Exp Pitch: {exp_p:.1f}", (10, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(display, f"Exp Yaw: {exp_y:.1f}", (10, y_start + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     def _handle_waiting(self, frame, display, results):
-        """
-        Logic:
-        1. Detect Face.
-        2. Try to Recognize for X frames.
-        3. If recognized -> Login.
-        4. If NOT recognized after X frames -> Start Calibration.
-        """
-        # 1. Check Face Detection
         if not results.multi_face_landmarks:
             self.visualizer.draw_no_user_text(display)
-            self.recognition_patience = 0 # Reset counter if face is lost
+            self.recognition_patience = 0 
             return
 
-        # 2. Try to recognize known user
-        user = self.user_manager.find_best_match(frame)
+        # OPTIMIZATION: Only search for user once every second (30 frames)
+        if self._frame_idx % self.USER_SEARCH_INTERVAL == 0:
+            user = self.user_manager.find_best_match(frame)
+            if user:
+                log.info(f"User identified: {user.user_id}")
+                self.user = user
+                self.detector.set_active_user(user)
+                self.current_mode = 'DETECTING'
+                self.recognition_patience = 0 
+                return
 
-        if user:
-            log.info(f"User identified: {user.user_id}")
-            self.user = user
-            self.detector.set_active_user(user)
-            self.current_mode = 'DETECTING'
-            self.recognition_patience = 0 # Reset
-            return
-
-        # 3. Face Present + No Match
         self.recognition_patience += 1
-        
         h, w = frame.shape[:2]
         
-        # PROGRESS BAR LOGIC
         buffer_limit = self.RECOGNITION_THRESHOLD
         progress = min(self.recognition_patience / buffer_limit, 1.0)
         
-        # Draw "Identifying" Bar
         bar_w = 200
         start_x = w//2 - bar_w//2
         cv2.rectangle(display, (start_x, h//2 + 40), (start_x + bar_w, h//2 + 50), (50,50,50), -1)
@@ -236,11 +317,8 @@ class DetectionLoop:
         
         cv2.putText(display, "IDENTIFYING USER...", (w//2 - 100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # 4. Only start calibration if we have tried recognizing for enough frames
         if self.recognition_patience > self.RECOGNITION_THRESHOLD:
             cv2.putText(display, "UNKNOWN USER - REGISTERING", (w//2 - 150, h//2 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.imshow("Drowsiness System", cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
-            cv2.waitKey(1)
             self._start_ear_calibration(frame)
 
     def _start_ear_calibration(self, frame):
@@ -270,4 +348,4 @@ class DetectionLoop:
             log.warning("Calibration failed.")
             self.current_mode = 'WAITING_FOR_USER'
         
-        self.recognition_patience = 0 # Reset counter
+        self.recognition_patience = 0
