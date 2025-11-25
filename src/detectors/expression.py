@@ -4,7 +4,7 @@ import numpy as np
 from collections import deque
 from typing import List, Tuple
 
-from src.utils.ear.constants import M_MAR
+from src.utils.constants import M_MAR
 
 log = logging.getLogger(__name__)
 

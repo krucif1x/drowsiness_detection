@@ -4,7 +4,6 @@ import yaml
 import os
 import numpy as np
 from pathlib import Path
-
 from src.infrastructure.hardware.camera import Camera
 from src.infrastructure.hardware.buzzer import Buzzer
 from src.services.user_manager import UserManager

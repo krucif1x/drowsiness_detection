@@ -8,22 +8,20 @@ from collections import deque
 from src.infrastructure.data.models import UserProfile
 from src.infrastructure.data.database import UnifiedDatabase
 from src.infrastructure.data.repository import UnifiedRepository
-from src.utils.models.model_loader import FaceModelLoader
-from src.utils.preprocessing.image_validator import ImageValidator
-from src.utils.face.encoding_extractor import FaceEncodingExtractor
-from src.utils.face.similarity_matcher import SimilarityMatcher
+from src.utils.face_recognition.model_loader import FaceModelLoader
+from src.utils.face_recognition.image_validator import ImageValidator
+from src.utils.face_recognition.encoding_extractor import FaceEncodingExtractor
+from src.utils.face_recognition.similarity_matcher import SimilarityMatcher
 
 class UserManager:
     def __init__(
         self, 
         database_file: str = r"data\drowsiness_events.db",
-        # Optimized threshold based on FaceNet typical distances
-        # FaceNet euclidean distances: same person ~0.4-0.6, different ~1.0+
-        recognition_threshold: float = 0.6,  # Conservative threshold for better accuracy
+        recognition_threshold: float = 0.5,  # Conservative threshold for better accuracy
         
         # Multi-frame validation reduces false positives significantly
         multi_frame_validation: bool = True,
-        min_consistent_frames: int = 3,  # Require 3 consistent detections
+        min_consistent_frames: int = 10,  # Require 3 consistent detections
         
         # Quality thresholds
         min_face_confidence: float = 0.95,  # Only use high-quality detections
@@ -75,10 +73,10 @@ class UserManager:
             'avg_match_distance': []
         }
         
-        self._load_users()
+        self.load_users()
         logging.info(f"UserManager initialized successfully with threshold={recognition_threshold}")
 
-    def _load_users(self):
+    def load_users(self):
         """Load all user profiles from database into memory cache."""
         try:
             with self._lock:
@@ -91,16 +89,16 @@ class UserManager:
             self.users = []
             self._user_id_map = {}
 
-    def _calculate_confidence_score(self, distance: float, threshold: float) -> float:
+    def calculate_confidence_score(self, distance: float, threshold: float) -> float:
         """
-        Calculate confidence score based on distance from threshold.
+        Calculate confidence score based on linear interpolation from threshold.
         Returns value between 0-1, where 1 is highest confidence.
         """
         if distance >= threshold:
             return 0.0
-        # Exponential decay for confidence
-        confidence = np.exp(-3 * (distance / threshold))
-        return min(confidence, 1.0)
+        # Linear interpolation: confidence decreases linearly as distance increases
+        confidence = 1.0 - (distance / threshold)
+        return max(confidence, 0.0)
 
     def find_best_match(self, image_frame, use_metadata: bool = False) -> Optional[UserProfile]:
         """
@@ -138,7 +136,7 @@ class UserManager:
             )
             
             # Calculate confidence
-            confidence = self._calculate_confidence_score(dist, self.recognition_threshold)
+            confidence = self.calculate_confidence_score(dist, self.recognition_threshold)
             
             # Update statistics
             self._match_stats['total_attempts'] += 1
@@ -278,78 +276,4 @@ class UserManager:
             logging.error(f"✗ User registration failed: {e}")
             return None
 
-    def get_match_statistics(self) -> dict:
-        """Return comprehensive matching statistics for monitoring and tuning."""
-        stats = self._match_stats.copy()
-        if stats['avg_match_distance']:
-            stats['avg_match_distance'] = np.mean(stats['avg_match_distance'])
-        else:
-            stats['avg_match_distance'] = 0.0
-        
-        if stats['total_attempts'] > 0:
-            stats['success_rate'] = stats['successful_matches'] / stats['total_attempts']
-        else:
-            stats['success_rate'] = 0.0
-        
-        # Add encoder and matcher stats
-        stats['encoder_stats'] = self.encoder.get_statistics()
-        stats['matcher_stats'] = self.matcher.get_statistics()
-        
-        return stats
-
-    def analyze_user_separability(self) -> dict:
-        """
-        Analyze how well registered users are separated.
-        Helps identify duplicates and optimize threshold.
-        """
-        return self.matcher.analyze_separability(self.users)
-
-    def find_potential_duplicates(self, threshold: float = 0.4) -> List[Tuple[int, int, float]]:
-        """
-        Find pairs of users that might be duplicates.
-        
-        Args:
-            threshold: Distance threshold for considering users as potential duplicates
-            
-        Returns:
-            List of (user_id_1, user_id_2, distance) tuples
-        """
-        if len(self.users) < 2:
-            return []
-        
-        dist_matrix = self.matcher.get_distance_matrix(self.users)
-        potential_duplicates = []
-        
-        for i in range(len(self.users)):
-            for j in range(i + 1, len(self.users)):
-                if dist_matrix[i, j] < threshold:
-                    potential_duplicates.append((
-                        self.users[i].user_id,
-                        self.users[j].user_id,
-                        float(dist_matrix[i, j])
-                    ))
-        
-        return sorted(potential_duplicates, key=lambda x: x[2])
-
-    def reset_match_buffer(self):
-        """Reset the multi-frame matching buffer. Call when user changes or resets."""
-        with self._lock:
-            self._recent_matches.clear()
-        logging.debug("Match buffer reset")
-
-    def adjust_threshold(self, new_threshold: float):
-        """
-        Dynamically adjust recognition threshold.
-        Use this for fine-tuning based on your environment.
-        
-        Recommended ranges:
-        - 0.4-0.5: Very strict (low false positives, may miss genuine matches)
-        - 0.6-0.7: Balanced (recommended for most cases)
-        - 0.8-0.9: Lenient (catches more matches, higher false positives)
-        """
-        old_threshold = self.recognition_threshold
-        self.recognition_threshold = new_threshold
-        logging.info(f"Recognition threshold adjusted: {old_threshold:.2f} -> {new_threshold:.2f}")
-        
-        # Reset buffer when changing threshold
-        self.reset_match_buffer()
+    
