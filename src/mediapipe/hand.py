@@ -11,10 +11,6 @@ class MediaPipeHandsWrapper:
             min_tracking_confidence=min_tracking_confidence
         )
 
-    @staticmethod
-    def preprocess(image: np.ndarray) -> np.ndarray:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
     def infer(self, image: np.ndarray, preprocessed: bool = False):
         if not preprocessed:
             image = self.preprocess(image)

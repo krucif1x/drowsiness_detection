@@ -88,6 +88,40 @@ class HandIdx:
     PINKY_PIP = 18
     PINKY_DIP = 19
     PINKY_TIP = 20
+    
+# ================================================================
+#                UPPER BODY POSE CONSTANTS (DRIVER POSTURE)
+# ================================================================
+
+class UpperBodyIdx:
+    """Only the essential upper-body pose landmarks."""
+
+    # Head & face reference
+    NOSE = 0
+    LEFT_EYE = 2
+    RIGHT_EYE = 5
+
+    # Upper body core joints
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+
+    # Torso reference (needed for angle estimations)
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+
+UPPER_BODY_LANDMARKS = [
+    UpperBodyIdx.NOSE,
+    UpperBodyIdx.LEFT_EYE, UpperBodyIdx.RIGHT_EYE,
+    UpperBodyIdx.LEFT_SHOULDER, UpperBodyIdx.RIGHT_SHOULDER,
+    UpperBodyIdx.LEFT_ELBOW, UpperBodyIdx.RIGHT_ELBOW,
+    UpperBodyIdx.LEFT_WRIST, UpperBodyIdx.RIGHT_WRIST,
+    UpperBodyIdx.LEFT_HIP, UpperBodyIdx.RIGHT_HIP
+]
+
 
 # Configuration constants
 CONSEC_FRAMES = 30

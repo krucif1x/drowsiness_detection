@@ -39,9 +39,9 @@ class HeadPoseEstimator:
         
         # Camera specs (optional - if None, will use simple approximation)
         self.camera_specs = camera_specs or {
-            "focal_mm": 3.67,
-            "sensor_w_mm": 4.8,
-            "sensor_h_mm": 3.6
+            "focal_mm": 4.74,
+            "sensor_w_mm": 6.45,
+            "sensor_h_mm": 3.63
         }
         self.use_camera_specs = camera_specs is not None
         
@@ -62,6 +62,18 @@ class HeadPoseEstimator:
         self.ALPHA_ROLL = 0.3
         
         logger.info("HeadPoseEstimator initialized")
+        
+    def _unwrap_angle(self, prev_deg: float, curr_deg: float, period: float = 180.0, threshold: float = 90.0) -> float:
+        """
+        Enforce continuity by shifting curr_deg by ±period to minimize jump vs prev_deg.
+        Use period=180 because RQDecomp can switch branches by ~180 deg.
+        """
+        delta = curr_deg - prev_deg
+        if delta > threshold:
+            curr_deg -= period
+        elif delta < -threshold:
+            curr_deg += period
+        return curr_deg
 
     def calculate_pose(self, face_landmarks, img_w, img_h):
         """Calculate head pose angles."""

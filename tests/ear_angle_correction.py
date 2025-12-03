@@ -3,6 +3,14 @@ EYE ASPECT RATIO (EAR) ANGLE CORRECTION
 Corrects foreshortening of EAR values when head is tilted or turned.
 """
 
+import os
+# Reduce TensorFlow/MediaPipe noise before imports
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")   # 0=all, 1=INFO, 2=WARNING, 3=ERROR
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")  # Force CPU; avoids some delegate logs
+
+import sys, pathlib
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+
 import numpy as np
 import logging
 import cv2
@@ -101,7 +109,7 @@ class EARAngleCorrector:
             yaw_asymmetry = 1.0 + (abs(yaw) / 90.0) * 0.3
             base_factor *= yaw_asymmetry
         
-        # Correct the EAR by multiplying by foreshortening factor
+        # Correct the EAR by multiplying with foreshortening factor
         # Higher factor = eyes appeared more closed, so true EAR is higher
         corrected_ear = measured_ear * base_factor
         
@@ -260,20 +268,25 @@ def calculate_ear(eye_landmarks, face_landmarks, img_w, img_h):
 LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]   # Left eye landmarks
 RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]  # Right eye landmarks
 
-if __name__ == "__main__":
+def main():
     logging.basicConfig(level=logging.INFO)
     corrector = EARAngleCorrector()
 
-    # Try to import head-pose estimator (optional). If unavailable, use zero angles.
+    # Try to import head-pose estimator (now using correct signature)
+    hpe = None
+    have_hpe = False
     try:
-        from src.mediapipe.head_pose_trail import HeadPoseEstimator  # try common filename
-        hpe = HeadPoseEstimator(camera_profile_name="logitech_c920x", img_w=1280, img_h=720)
+        from src.mediapipe.head_pose import HeadPoseEstimator
+        camera_specs = {
+            "focal_mm": 4.74,
+            "sensor_w_mm": 6.45,
+            "sensor_h_mm": 3.63
+        }
+        hpe = HeadPoseEstimator(camera_specs=camera_specs)
         have_hpe = True
         logger.info("HeadPoseEstimator loaded - using pose compensation")
-    except Exception:
-        hpe = None
-        have_hpe = False
-        logger.warning("HeadPoseEstimator not available - using zero head angles")
+    except Exception as e:
+        logger.warning(f"HeadPoseEstimator not available - using zero head angles ({e})")
 
     mp_face = mp.solutions.face_mesh
     face_mesh = mp_face.FaceMesh(static_image_mode=False,
@@ -288,7 +301,7 @@ if __name__ == "__main__":
 
     instructions = [
         "Keys: ESC/q=quit  s=start calib  a=add sample  f=finish calib",
-        "If HeadPoseEstimator present, pose used; otherwise angles=0"
+        "Pose compensation enabled" if have_hpe else "Pose compensation disabled"
     ]
 
     last_fps_t = time.time()
@@ -315,7 +328,8 @@ if __name__ == "__main__":
                 if have_hpe:
                     try:
                         pitch, yaw, roll = hpe.calculate_pose(face_landmarks, img_w, img_h)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Head pose failed, falling back to zeros: {e}")
                         pitch = yaw = roll = 0.0
 
                 # compute EARs
@@ -337,15 +351,13 @@ if __name__ == "__main__":
 
                 # Draw small bars for raw vs corrected EAR
                 def draw_bar(img, x, y, w, h, value, maxv=0.6, color=(0,200,0)):
-                    v = np.clip(value / maxv, 0.0, 1.0)
+                    v = np.clip((value or 0.0) / maxv, 0.0, 1.0)
                     cv2.rectangle(img, (x, y), (x + w, y + h), (50,50,50), 1)
                     cv2.rectangle(img, (x, int(y + h*(1-v))), (x + w, y + h), color, -1)
 
-                # left ear
                 if left_raw is not None:
                     draw_bar(frame, 20, 80, 20, 80, left_raw, color=(0,0,200))
                     draw_bar(frame, 50, 80, 20, 80, corrected_left, color=(0,200,0))
-                # right ear
                 if right_raw is not None:
                     draw_bar(frame, 100, 80, 20, 80, right_raw, color=(0,0,200))
                     draw_bar(frame, 130, 80, 20, 80, corrected_right, color=(0,200,0))
@@ -363,7 +375,8 @@ if __name__ == "__main__":
                 overlay_y += 18
                 cv2.putText(frame, f"Left corr:{corrected_left:.3f}  Right corr:{corrected_right:.3f}", (10, overlay_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,100), 1, cv2.LINE_AA)
                 overlay_y += 18
-                cv2.putText(frame, f"Openness: {openness_pct:.1f}%", (10, overlay_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                if openness_pct is not None:
+                    cv2.putText(frame, f"Openness: {openness_pct:.1f}%", (10, overlay_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
             # FPS
             t1 = time.time()
@@ -379,7 +392,7 @@ if __name__ == "__main__":
             elif key == ord('s'):
                 corrector.start_calibration()
             elif key == ord('a'):
-                # add calibration sample if face present
+                # add calibration sample if face present and near frontal
                 if left_raw is not None and right_raw is not None and abs(pitch) < 10 and abs(yaw) < 10 and abs(roll) < 10:
                     avg = (left_raw + right_raw) / 2.0
                     corrector.add_calibration_sample(avg, pitch, yaw, roll)
@@ -390,3 +403,6 @@ if __name__ == "__main__":
         face_mesh.close()
         cap.release()
         cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

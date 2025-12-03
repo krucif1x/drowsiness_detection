@@ -98,28 +98,35 @@ class DetectionLoop:
             self.camera.release()
             
     def process_frame(self):
-        frame = self.camera.read()
-        if frame is None: return
+        frame = self.camera.read()  # Already RGB from camera.py
+        if frame is None: 
+            return
 
         self._frame_idx += 1
         fps = self.fps_tracker.update()
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        results = self.face_mesh.process(frame_rgb)
+        # Use RGB directly for MediaPipe (no conversion needed)
+        results = self.face_mesh.process(frame)
 
+        # Hand inference on RGB (every N frames)
         if self._frame_idx % self.HAND_INFERENCE_INTERVAL == 0:
-            self._cached_hands_data = self.hand_wrapper.infer(frame_rgb, preprocessed=True)
+            self._cached_hands_data = self.hand_wrapper.infer(frame, preprocessed=True)
         hands_data = self._cached_hands_data
 
-        display = frame.copy()
+        # Convert to BGR for OpenCV display
+        display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         if self.current_mode == 'WAITING_FOR_USER':
             self.face_recognition(frame, display, results)
         elif self.current_mode == 'DETECTING':
             self.detection(frame, display, results, hands_data, fps)
 
-        cv2.putText(display, f"MODE: {self.current_mode}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-        cv2.imshow("Drowsiness System", cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
+        # Draw mode indicator
+        cv2.putText(display, f"MODE: {self.current_mode}", (10, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        
+        # Display BGR frame directly (no conversion needed)
+        cv2.imshow("Drowsiness System", display)
 
 
     def detection(self, frame, display, results, hands_data, fps):
@@ -130,13 +137,11 @@ class DetectionLoop:
         h, w = frame.shape[:2]
         raw_lms = results.multi_face_landmarks[0]
         
-        # --- DATA EXTRACTION ---
-        
-        # 1. Head Pose
+        # Head Pose (degrees)
         pose = self.head_pose_estimator.calculate_pose(raw_lms, w, h)
         pitch, yaw, roll = pose if pose else (0.0, 0.0, 0.0)
         
-        # 2. Face Landmarks (Pixels)
+        # Face Landmarks (Pixels)
         lms = [(int(l.x*w), int(l.y*h)) for l in raw_lms.landmark]
         coords = {
             'left_eye': [lms[i] for i in L_EAR], 
@@ -144,29 +149,22 @@ class DetectionLoop:
             'mouth': [lms[i] for i in M_MAR]
         }
         
-        # 3. Face Center (Normalized, 0–1)
+        # Face Center (Normalized)
         nose_tip = raw_lms.landmark[1]
         face_center_norm = (nose_tip.x, nose_tip.y)
         
-        # 4. Metrics Calculation
+        # Metrics
         left = self.ear_calibrator.ear_calculator.calculate(coords['left_eye'])
         right = self.ear_calibrator.ear_calculator.calculate(coords['right_eye'])
         mar = self.mar_calculator.calculate(coords['mouth'])
         ear = (left + right) / 2.0
         avg_ear = self.ear_smoother.update(ear)
         
-        # 5. Expression Classification (pass normalized info properly)
-        # Optimize call: supply mouth landmarks in pixels and img_h for quick ratios.
-        expr = self.expression_classifier.classify(
-            lms, 
-            h, 
-            hands_data=hands_data
-        )
+        # Expression
+        expr = self.expression_classifier.classify(lms, h, hands_data=hands_data)
 
-        # Update last frame for logging in drowsiness
+        # Drowsiness
         self.detector.set_last_frame(frame)
-        
-        # 6. Detect Drowsiness
         drowsy_status, drowsy_color = self.detector.detect(
             avg_ear, mar, expr, 
             hands_data=hands_data, 
@@ -177,28 +175,32 @@ class DetectionLoop:
         is_drowsy = drowsy_state.get('is_drowsy', False)
         eyes_closed = self.detector.states.get('EYES_CLOSED', False)
 
-        # 7. Distraction (sets its own context including phone/eating/wheel)
+        # Normalize hands to 0..1 for distraction detector
+        norm_hands = []
+        if hands_data:
+            for hand in hands_data:
+                norm_hand = [(pt[0] / w, pt[1] / h) for pt in hand]
+                norm_hands.append(norm_hand)
+
+        # Distraction with normalized hands
         is_distracted, should_log_distraction = self.distraction_detector.analyze(
             pitch, yaw, roll,
-            hands=hands_data,
+            hands=norm_hands,  # ✅ Normalized
             face=face_center_norm
         )
 
-        # 8. Fainting: feed context and analyze
-        # Context from distraction + drowsiness
-        phone_flag = self.distraction_detector.context.get('phone', False)
-        wheel_count = self.distraction_detector.context.get('wheel', 0)
+        # Fainting - simplified (no phone/wheel context in new detector)
         self.fainting_detector.set_context(
             drowsy=is_drowsy,
             eyes_closed=eyes_closed,
-            phone=phone_flag,
-            wheel_count=wheel_count
+            phone=False,  # ✅ Removed context dependency
+            wheel_count=0  # ✅ Removed context dependency
         )
         is_fainting, faint_is_new = self.fainting_detector.analyze(
-            pitch=pitch, yaw=yaw, roll=roll, hands=hands_data, face_center=face_center_norm
+            pitch=pitch, yaw=yaw, roll=roll, hands=norm_hands, face_center=face_center_norm
         )
 
-        # --- STATUS & UI LOGIC ---
+        # Status & UI Logic
         final_status = drowsy_status
         final_color = drowsy_color
 
@@ -206,7 +208,8 @@ class DetectionLoop:
             final_status = drowsy_status 
             final_color = (255, 255, 0)
             if is_distracted:
-                cv2.putText(display, "LOOK FORWARD", (w//2 - 100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+                cv2.putText(display, "LOOK FORWARD", (w//2 - 100, h//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
         elif is_fainting:
             final_status = "FAINTING!"
             final_color = (255, 0, 255)
@@ -224,23 +227,27 @@ class DetectionLoop:
         elif is_distracted:
             reason = self.distraction_detector.distraction_type
             
-            if reason == "PHONE":
-                final_status = "PHONE DETECTED!"
-                final_color = (0, 0, 255)
-            elif "HAND" in reason or "EATING" in reason:
-                final_status = "HAND ON FACE"
-                final_color = (0, 200, 255)
+            if "BOTH HANDS" in reason:
+                final_status = "BOTH HANDS VISIBLE!"
+                final_color = (0, 0, 255)  # Red
+            elif "ONE HAND" in reason:
+                final_status = "ONE HAND VISIBLE"
+                final_color = (0, 165, 255)  # Orange
             elif "ASIDE" in reason:
                 final_status = "LOOKING ASIDE"
-                final_color = (0, 255, 255)
+                final_color = (0, 255, 255)  # Yellow
             elif "DOWN" in reason:
-                final_status = "EYES ON ROAD"
-                final_color = (0, 255, 255)
+                final_status = "LOOKING DOWN"
+                final_color = (0, 255, 255)  # Yellow
+            elif "UP" in reason:
+                final_status = "LOOKING UP"
+                final_color = (0, 255, 255)  # Yellow
             else:
                 final_status = "DISTRACTED"
                 final_color = (0, 0, 255)
             
             if should_log_distraction:
+                log.warning(f"Logging distraction: {reason}")
                 self.logger.alert("distraction")
                 self.logger.log_event(self.user.user_id, f"DISTRACTION_{reason}", 2.5, 0.0, frame)
         

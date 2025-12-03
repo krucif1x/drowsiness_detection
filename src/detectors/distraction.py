@@ -1,6 +1,5 @@
 import time
 import logging
-import math
 import yaml
 from collections import deque
 
@@ -8,8 +7,10 @@ log = logging.getLogger(__name__)
 
 class DistractionDetector:
     """
-    Focused on distraction only: gaze direction thresholds and hand/phone/eating/wheel context.
-    Any fainting detection is handled by FaintingDetector externally.
+    Simple camera-appropriate distraction detector:
+    - Camera shows face + shoulders only (hands normally NOT visible)
+    - If ANY hand appears in frame = driver not holding wheel properly
+    - Also checks extreme head angles (looking away)
     """
 
     def __init__(self, fps=30.0, camera_pitch=0.0, camera_yaw=0.0, config_path="config/detector_config.yaml"):
@@ -22,131 +23,120 @@ class DistractionDetector:
         self.start_time = None
 
         # Calibration
-        self.cal = {'pitch': camera_pitch, 'yaw': camera_yaw, 'roll': 0.0}
+        self.cal = {'pitch': camera_pitch, 'yaw': camera_yaw}
 
-        # History Buffers
+        # History: track violations over last N frames
         self.history = deque(maxlen=5)
 
-        # Context Trackers (no fainting state here)
-        self.context = {'phone': False, 'eating': False, 'wheel': 0, 'drowsy': False, 'eyes_closed': False}
+        # Metrics
         self.metrics = {'total_distractions': 0}
 
-        log.info("DistractionDetector initialized (Distraction-only)")
+        log.info("DistractionDetector initialized (Simple hand-based)")
 
     def _load_config(self, path, fps):
         defaults = {
-            'yaw': 50.0,
-            'pitch_down': 28.0,
-            'pitch_up': 25.0,
-            'roll': 40.0,
-            'phone_min': 18.0,
-            'phone_max': 38.0,
-            't_gaze': 2.5,
-            't_phone': 1.0,
-            't_face': 2.0,
-            'zone_phone_y': 0.55,
-            'zone_phone_x': 0.25,
-            'zone_wheel_y': 0.65
+            'yaw_threshold': 40.0,           # degrees - extreme head turn
+            'pitch_down_threshold': 28.0,    # degrees - looking way down
+            'pitch_up_threshold': 25.0,      # degrees - looking way up
+            'time_hands_visible': 1.5,       # seconds with hands visible before unsafe
+            'time_gaze': 1.2,                # seconds looking away (reduced from 2.5)
         }
         try:
             with open(path, 'r') as f:
                 raw = yaml.safe_load(f) or {}
-                distraction_cfg = raw.get('distraction', {})
+                dist = raw.get('distraction', {})
                 return {
-                    'yaw': distraction_cfg.get('yaw_threshold', defaults['yaw']),
-                    'pitch_down': distraction_cfg.get('pitch_down_threshold', defaults['pitch_down']),
-                    'pitch_up': distraction_cfg.get('pitch_up_threshold', defaults['pitch_up']),
-                    'roll': distraction_cfg.get('roll_threshold', defaults['roll']),
-                    'phone_min': distraction_cfg.get('phone_pitch_min', defaults['phone_min']),
-                    'phone_max': distraction_cfg.get('phone_pitch_max', defaults['phone_max']),
-                    't_gaze': distraction_cfg.get('time_gaze', defaults['t_gaze']),
-                    't_phone': distraction_cfg.get('time_phone', defaults['t_phone']),
-                    't_face': distraction_cfg.get('time_hand_face', defaults['t_face']),
-                    'zone_phone_y': distraction_cfg.get('phone_zone_y_max', defaults['zone_phone_y']),
-                    'zone_phone_x': distraction_cfg.get('phone_zone_x_outer', defaults['zone_phone_x']),
-                    'zone_wheel_y': distraction_cfg.get('wheel_zone_y_min', defaults['zone_wheel_y'])
+                    'yaw_threshold': dist.get('yaw_threshold', defaults['yaw_threshold']),
+                    'pitch_down_threshold': dist.get('pitch_down_threshold', defaults['pitch_down_threshold']),
+                    'pitch_up_threshold': dist.get('pitch_up_threshold', defaults['pitch_up_threshold']),
+                    'time_hands_visible': dist.get('time_hands_visible', defaults['time_hands_visible']),
+                    'time_gaze': dist.get('time_gaze', defaults['time_gaze']),
                 }
         except Exception as e:
-            log.warning(f"Failed to load distraction config: {e}")
+            log.warning(f"Failed to load distraction config: {e}, using defaults")
             return defaults
-
-    def set_drowsiness_state(self, is_drowsy, eyes_closed):
-        self.context['drowsy'] = is_drowsy
-        self.context['eyes_closed'] = eyes_closed
-
-    def detect_hand_context(self, hands, face):
-        self.context.update({'phone': False, 'eating': False, 'wheel': 0})
-        if not hands:
-            return
-
-        for h in hands:
-            wrist, finger = h[0], h[12]
-            if wrist[1] > self.cfg['zone_wheel_y']:
-                self.context['wheel'] += 1
-                continue
-
-            is_high = finger[1] < self.cfg['zone_phone_y']
-            is_side = not (self.cfg['zone_phone_x'] < finger[0] < (1.0 - self.cfg['zone_phone_x']))
-            if is_high and is_side:
-                self.context['phone'] = True
-                continue
-
-            if face and ((finger[0]-face[0])**2 + (finger[1]-face[1])**2) ** 0.5 < 0.15:
-                if not self.context['phone']:
-                    self.context['eating'] = True
 
     def analyze(self, pitch, yaw, roll, hands=None, face=None):
         """
-        Distraction decision only. Fainting must be handled by FaintingDetector separately.
-        Returns (is_distracted, is_new_event).
+        Simple logic for face+shoulders camera view:
+        1. If ANY hand visible in frame = hands off wheel (unsafe)
+        2. If head angle extreme = looking away (unsafe)
+        
+        Returns (is_distracted, is_new_event)
         """
         if not (abs(pitch) < 90 and abs(yaw) < 90):
             return False, False
 
-        self.detect_hand_context(hands, face)
+        # Check for hands in frame (any hand = distraction)
+        hands_visible = hands and len(hands) > 0
 
-        dp, dy = pitch - self.cal['pitch'], abs(yaw - self.cal['yaw'])
-        violations = []
-        if self.context['phone']:
-            violations.append("PHONE")
-        elif dp > self.cfg['pitch_down']:
-            violations.append("LOOKING DOWN")
-        elif dy > self.cfg['yaw']:
-            violations.append("LOOKING ASIDE")
-        elif dp < -self.cfg['pitch_up']:
-            violations.append("LOOKING UP")
-        elif self.context['eating'] and "PHONE" not in violations:
-            violations.append("HAND ON FACE")
+        # Check head pose violations
+        dp = pitch - self.cal['pitch']
+        dy = abs(yaw - self.cal['yaw'])
+        
+        gaze_violation = (
+            dy > self.cfg['yaw_threshold'] or 
+            dp > self.cfg['pitch_down_threshold'] or 
+            dp < -self.cfg['pitch_up_threshold']
+        )
 
-        self.history.append(len(violations) > 0)
-        if sum(self.history) >= 3:
-            if self.start_time is None:
-                self.start_time = time.time()
-            elapsed = time.time() - self.start_time
-            # Choose timer by type
-            if "PHONE" in violations:
-                limit = self.cfg['t_phone']
-            elif "HAND ON FACE" in violations:
-                limit = self.cfg['t_face']
+        # Determine violation type and threshold
+        violation_type = None
+        time_threshold = None
+
+        if hands_visible:
+            num_hands = len(hands)
+            if num_hands == 1:
+                violation_type = "ONE HAND OFF WHEEL"
             else:
-                limit = self.cfg['t_gaze']
+                violation_type = "BOTH HANDS OFF WHEEL"
+            time_threshold = self.cfg['time_hands_visible']
+        elif gaze_violation:
+            if dy > self.cfg['yaw_threshold']:
+                violation_type = "LOOKING ASIDE"
+            elif dp > self.cfg['pitch_down_threshold']:
+                violation_type = "LOOKING DOWN"
+            else:
+                violation_type = "LOOKING UP"
+            time_threshold = self.cfg['time_gaze']
+        else:
+            # No hands visible and good head pose = SAFE (hands on wheel below camera)
+            violation_type = None
 
-            if elapsed > limit:
+        # Track in history
+        self.history.append(violation_type is not None)
+
+        # Require 3 out of 5 frames to have violation
+        history_sum = sum(self.history)
+        if history_sum >= 3 and violation_type:
+            if self.start_time is None or self.distraction_type != violation_type:
+                # New violation or type changed - reset timer
+                self.start_time = time.time()
+                self.distraction_type = violation_type
+            
+            elapsed = time.time() - self.start_time
+            
+            if elapsed >= time_threshold:
                 if not self.is_distracted:
+                    # New distraction event
                     self.is_distracted = True
                     self.metrics['total_distractions'] += 1
-                    self.distraction_type = violations[0] if violations else "DISTRACTED"
                     return True, True
-                return True, False
+                else:
+                    # Ongoing distraction
+                    return True, False
+            
             return False, False
         else:
+            # No stable violation - reset
             self.start_time = None
             self.is_distracted = False
             self.distraction_type = "NORMAL"
             return False, False
 
-    def get_status(self, p, y, r):
+    def get_status(self):
         return {
             'is_distracted': self.is_distracted,
-            'type': self.distraction_type
+            'type': self.distraction_type,
+            'metrics': self.metrics
         }

@@ -34,3 +34,19 @@ image:
 system:
   vin: "VIN-0001"
   target_fps: 30.0
+
+# Fainting Detection
+fainting:
+  pitch_extreme: 45.0        # deg above camera pitch
+  rapid_change: 12.0         # deg over history window
+  history_sec: 0.6           # seconds for pitch/face trend
+  vis_window_sec: 0.6        # seconds for visibility smoothing
+  face_slump_trend_min: 0.006  # downward slope threshold
+  min_confirm_sec: 1.0       # require sustained indicators
+  phone_pitch_min: 18.0
+  phone_pitch_max: 38.0
+  var_stable_max: 5.0        # variance threshold for stable phone posture
+  var_unstable_min: 10.0
+  vis_face_thr: 0.40         # min face visibility to count as visible
+  vis_sh_thr: 0.35           # min shoulder visibility
+  prob_threshold: 0.75       # final probability to declare fainting

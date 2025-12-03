@@ -25,12 +25,6 @@ class MediaPipeFaceModel:
             min_tracking_confidence=min_tracking_confidence
         )
 
-    def preprocess(self, image: np.ndarray) -> np.ndarray:
-        """
-        Convert the image from BGR (OpenCV default) to RGB (MediaPipe requirement).
-        """
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
     def process(self, image: np.ndarray):
         """
         Run the model on an image.
@@ -38,11 +32,9 @@ class MediaPipeFaceModel:
         Returns:
             The raw MediaPipe results object (containing multi_face_landmarks).
         """
-        # 1. Convert color space
-        rgb_image = self.preprocess(image)
         
         # 2. Run inference
-        results = self.face_mesh.process(rgb_image)
+        results = self.face_mesh.process(image)
         
         return results
 
